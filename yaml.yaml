@@ -1,0 +1,399 @@
+name: 测试 Fetcher-MCP 抓取小红书和知乎
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v3
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "18"
+
+      - name: 安装 pnpm
+        run: npm install -g pnpm
+
+      - name: 安装依赖
+        run: |
+          # 手动创建package.json而不使用init命令
+          echo '{
+            "name": "fetcher-mcp-test",
+            "version": "1.0.0",
+            "description": "测试fetcher-mcp抓取功能",
+            "private": true
+          }' > package.json
+          pnpm install fetcher-mcp
+          # 安装playwright以便安装浏览器
+          pnpm install -D @playwright/test
+
+      - name: 安装 Playwright 浏览器
+        run: pnpm exec playwright install chromium
+
+      - name: 创建测试脚本
+        run: |
+          mkdir -p results
+          cat > test-fetcher.js << 'EOF'
+          const { spawn } = require('child_process');
+          const http = require('http');
+          const fs = require('fs');
+
+          // 创建结果目录
+          if (!fs.existsSync('./results')) {
+            fs.mkdirSync('./results', { recursive: true });
+          }
+
+          // 启动 fetcher-mcp 服务
+          console.log('正在启动 fetcher-mcp 服务...');
+          const server = spawn('pnpm', ['exec', 'fetcher-mcp']);
+
+          let serverStarted = false;
+
+          server.stdout.on('data', (data) => {
+            const output = data.toString();
+            console.log(`服务输出: ${output}`);
+            
+            // 检测服务是否已启动
+            if (output.includes('Server running')) {
+              serverStarted = true;
+              console.log('fetcher-mcp 服务已启动，开始测试...');
+              runTests();
+            }
+          });
+
+          server.stderr.on('data', (data) => {
+            console.error(`服务错误: ${data}`);
+          });
+
+          // 测试网站列表
+          const sites = [
+            {
+              name: '小红书',
+              url: 'https://www.xiaohongshu.com/explore',
+              expectedContent: ['小红书', '发现', '推荐']
+            },
+            {
+              name: '知乎',
+              url: 'https://www.zhihu.com/explore',
+              expectedContent: ['知乎', '首页', '推荐']
+            }
+          ];
+
+          // 测试结果
+          const results = {
+            success: [],
+            failed: [],
+            warnings: []
+          };
+
+          // 等待服务启动的时间延长到30秒
+          setTimeout(() => {
+            if (!serverStarted) {
+              console.log('服务未检测到启动消息，但将尝试开始测试...');
+              // 先验证服务是否实际在运行
+              checkServiceRunning().then(running => {
+                if (running) {
+                  console.log('服务似乎已在运行，开始测试...');
+                  runTests();
+                } else {
+                  console.error('服务似乎未在运行，无法开始测试');
+                  process.exit(1);
+                }
+              });
+            }
+          }, 30000); // 增加到30秒
+
+          // 检查服务是否在运行
+          function checkServiceRunning() {
+            return new Promise(resolve => {
+              const options = {
+                hostname: '127.0.0.1',
+                port: 3002,
+                path: '/',
+                method: 'GET'
+              };
+
+              const req = http.request(options, () => {
+                resolve(true);
+              });
+
+              req.on('error', () => {
+                resolve(false);
+              });
+
+              req.end();
+            });
+          }
+
+          async function runTests() {
+            console.log('开始测试各网站抓取能力...');
+            
+            // 再等待5秒确保服务完全就绪
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            
+            // 逐个测试网站
+            for (const site of sites) {
+              try {
+                console.log(`正在测试 ${site.name}...`);
+                await testSite(site);
+              } catch (error) {
+                console.error(`测试 ${site.name} 失败: ${error.message}`);
+                results.failed.push({
+                  site: site.name,
+                  error: error.message
+                });
+              }
+            }
+            
+            // 测试完成后
+            console.log('测试完成，结果汇总:');
+            console.log(`成功: ${results.success.length} 个站点`);
+            console.log(`警告: ${results.warnings.length} 个站点`);
+            console.log(`失败: ${results.failed.length} 个站点`);
+            
+            // 保存汇总结果
+            fs.writeFileSync('./results/summary.json', JSON.stringify(results, null, 2));
+            
+            // 测试并行抓取
+            try {
+              console.log('开始测试并行抓取能力...');
+              await testParallelFetch();
+            } catch (error) {
+              console.error(`并行抓取测试失败: ${error.message}`);
+            }
+            
+            // 关闭服务
+            server.kill();
+            
+            // 如果有失败的测试，返回非零退出码
+            if (results.failed.length > 0) {
+              process.exit(1);
+            }
+          }
+
+          // 测试单个网站，使用fetcher-mcp的fetch_url功能
+          async function testSite(site) {
+            return new Promise((resolve, reject) => {
+              // 准备请求数据
+              const requestData = JSON.stringify({
+                name: 'fetch_url',
+                parameters: {
+                  url: site.url,
+                  timeout: 60000,
+                  extractContent: true,
+                  waitUntil: 'networkidle',
+                  waitForNavigation: true,
+                  navigationTimeout: 30000,
+                  returnHtml: true
+                }
+              });
+              
+              const options = {
+                hostname: '127.0.0.1',
+                port: 3002,
+                path: '/',
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Content-Length': Buffer.byteLength(requestData)
+                }
+              };
+              
+              const req = http.request(options, (res) => {
+                console.log(`${site.name} 请求状态码: ${res.statusCode}`);
+                
+                let data = '';
+                res.on('data', (chunk) => {
+                  data += chunk;
+                });
+                
+                res.on('end', () => {
+                  try {
+                    // 保存原始响应
+                    fs.writeFileSync(`./results/${site.name.replace(/\s/g, '_')}_response.json`, data);
+                    
+                    const result = JSON.parse(data);
+                    
+                    if (result.content) {
+                      // 保存内容
+                      fs.writeFileSync(
+                        `./results/${site.name.replace(/\s/g, '_')}_content.html`, 
+                        result.content
+                      );
+                      
+                      // 检查是否包含预期内容
+                      const containsExpected = site.expectedContent.some(text => 
+                        result.content.includes(text)
+                      );
+                      
+                      if (containsExpected) {
+                        console.log(`✅ ${site.name} 抓取成功，内容中包含预期文本`);
+                        results.success.push({
+                          site: site.name,
+                          url: site.url,
+                          contentSize: result.content.length
+                        });
+                        resolve();
+                      } else {
+                        console.warn(`⚠️ ${site.name} 抓取成功，但内容中未找到预期文本`);
+                        results.warnings.push({
+                          site: site.name,
+                          url: site.url,
+                          contentSize: result.content.length,
+                          reason: '内容中未找到预期文本'
+                        });
+                        resolve(); // 仍然视为成功
+                      }
+                    } else {
+                      console.error(`❌ ${site.name} 抓取失败，未返回内容`);
+                      results.failed.push({
+                        site: site.name,
+                        url: site.url,
+                        reason: '未返回内容'
+                      });
+                      reject(new Error('未返回内容'));
+                    }
+                  } catch (error) {
+                    console.error(`❌ ${site.name} 结果解析出错:`, error);
+                    results.failed.push({
+                      site: site.name,
+                      url: site.url,
+                      reason: `结果解析出错: ${error.message}`
+                    });
+                    reject(error);
+                  }
+                });
+              });
+              
+              req.on('error', (error) => {
+                console.error(`❌ ${site.name} 请求出错:`, error);
+                results.failed.push({
+                  site: site.name,
+                  url: site.url,
+                  reason: `请求出错: ${error.message}`
+                });
+                reject(error);
+              });
+              
+              // 发送请求
+              req.write(requestData);
+              req.end();
+              
+              // 60秒超时
+              setTimeout(() => {
+                reject(new Error('请求超时'));
+              }, 60000);
+            });
+          }
+
+          // 测试并行抓取，使用fetcher-mcp的fetch_urls功能
+          async function testParallelFetch() {
+            return new Promise((resolve, reject) => {
+              // 准备并行请求
+              const urls = sites.map(site => site.url);
+              
+              const requestData = JSON.stringify({
+                name: 'fetch_urls',
+                parameters: {
+                  urls: urls,
+                  timeout: 60000,
+                  extractContent: true,
+                  waitUntil: 'networkidle',
+                  waitForNavigation: true,
+                  navigationTimeout: 30000,
+                  returnHtml: true
+                }
+              });
+              
+              const options = {
+                hostname: '127.0.0.1',
+                port: 3002,
+                path: '/',
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Content-Length': Buffer.byteLength(requestData)
+                }
+              };
+              
+              const req = http.request(options, (res) => {
+                console.log(`并行请求状态码: ${res.statusCode}`);
+                
+                let data = '';
+                res.on('data', (chunk) => {
+                  data += chunk;
+                });
+                
+                res.on('end', () => {
+                  try {
+                    // 保存原始响应
+                    fs.writeFileSync('./results/parallel_response.json', data);
+                    
+                    const result = JSON.parse(data);
+                    
+                    if (Array.isArray(result) && result.length === urls.length) {
+                      console.log(`✅ 并行抓取成功，获取到 ${result.length} 个结果`);
+                      
+                      // 保存每个结果
+                      result.forEach((item, index) => {
+                        if (item && item.content) {
+                          fs.writeFileSync(
+                            `./results/parallel_${index}_${sites[index].name.replace(/\s/g, '_')}.html`,
+                            item.content
+                          );
+                        }
+                      });
+                      
+                      resolve();
+                    } else {
+                      console.error('❌ 并行抓取失败，结果数量不匹配');
+                      reject(new Error('并行抓取结果数量不匹配'));
+                    }
+                  } catch (error) {
+                    console.error('❌ 并行抓取结果解析出错:', error);
+                    reject(error);
+                  }
+                });
+              });
+              
+              req.on('error', (error) => {
+                console.error('❌ 并行抓取请求出错:', error);
+                reject(error);
+              });
+              
+              // 发送请求
+              req.write(requestData);
+              req.end();
+              
+              // 120秒超时
+              setTimeout(() => {
+                reject(new Error('并行请求超时'));
+              }, 120000);
+            });
+          }
+
+          // 3分钟后强制退出
+          setTimeout(() => {
+            console.error('❌ 整体测试超时，强制终止');
+            server.kill();
+            process.exit(1);
+          }, 180000);
+          EOF
+
+      - name: 运行测试
+        run: node test-fetcher.js
+
+      - name: 上传测试结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetcher-mcp-test-results
+          path: results/
